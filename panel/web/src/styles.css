@@ -1017,6 +1017,23 @@ button {
   background: rgba(245 158 11 / 0.1);
   border-radius: 10px;
 }
+.upgrade-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin: 2px 0 14px;
+  padding: 11px 14px;
+  border-radius: 14px;
+  background: rgba(245 158 11 / 0.12);
+  color: var(--text);
+  font-size: 13.5px;
+  line-height: 1.5;
+}
+.upgrade-banner .s-btn {
+  flex: none;
+}
 .ver-hint code {
   font-size: 12px;
   padding: 1px 5px;

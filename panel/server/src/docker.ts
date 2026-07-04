@@ -470,6 +470,29 @@ export async function instanceRuntime(inst: Instance): Promise<RuntimeState> {
   }
 }
 
+// 本地「最新实例镜像」的 Id（新建/升级实例会用到的镜像）。查不到（未拉取过）返回 null。
+export async function latestInstanceImageId(): Promise<string | null> {
+  try {
+    const img: any = await docker.getImage(WECHAT_IMAGE).inspect();
+    return String(img.Id);
+  } catch {
+    return null;
+  }
+}
+
+// 实例是否「镜像落后」：其运行中容器的镜像 Id 与本地最新镜像不一致（即重建就会换新镜像）。
+// 容器不存在 / 查不到最新镜像时返回 false（不打扰）。传入 latestId 复用一次查询，避免 N 次 inspect。
+export async function instanceOutdated(inst: Instance, latestId: string | null): Promise<boolean> {
+  if (!latestId) return false;
+  try {
+    const info: any = await docker.getContainer(inst.containerName).inspect();
+    const cur = String(info.Image || '');
+    return !!cur && cur !== latestId;
+  } catch {
+    return false; // 容器不存在（未创建/已删）→ 不算落后
+  }
+}
+
 // 创建 exec 实例。容器 init 未完成时，linuxserver 基镜像的 'abc' 用户可能还没建好，docker 会以
 // 400「unable to find user abc: no matching entries in passwd file」直接拒绝创建 exec（见 issue #74）。
 // 对这种"用户未就绪"错误短暂重试，给容器 init 一点时间；超时则抛清晰的中文错误，而非透传难懂的 docker 400。
@@ -1061,8 +1084,21 @@ export async function uploadBackground(inst: Instance, name: string, content: Bu
   await docker.getContainer(inst.containerName).putArchive(tarSingleFile(name, content), { path: BG_DIR });
 }
 
+// 检查实例容器内是否有某命令；没有则抛出友好错误（多为旧镜像未升级，避免用户看懵"退出码 127"）。
+async function assertHasTool(inst: Instance, tool: string, msg: string): Promise<void> {
+  let ok = false;
+  try {
+    const out = await execCapture(inst, ['sh', '-c', `command -v ${tool} >/dev/null 2>&1 && printf ok`]);
+    ok = out.trim() === 'ok';
+  } catch {
+    ok = false;
+  }
+  if (!ok) throw new Error(msg);
+}
+
 export async function applyBackground(inst: Instance, name: string): Promise<void> {
   if (!safeMediaName(name)) throw new Error('文件名不合法');
+  await assertHasTool(inst, 'xwallpaper', '该实例镜像过旧（缺壁纸组件 xwallpaper）。请先在「管理」对该实例点「升级」，再设置壁纸。');
   await execCapture(inst, ['sh', '-c', `DISPLAY=:1 xwallpaper --zoom '${BG_DIR}/${name}' 2>/dev/null`]);
   await execCapture(inst, ['sh', '-c', `echo '${name}' > '${WP_FILE}'`]);
 }

@@ -43,6 +43,8 @@ import {
   runInstance,
   stopInstance,
   upgradeInstance,
+  latestInstanceImageId,
+  instanceOutdated,
   removeInstance as removeInstanceContainer,
   instanceRuntime,
   triggerWechat,
@@ -649,6 +651,42 @@ app.post('/api/admin/instances/:id/upgrade', async (req, reply) => {
     appendPanelLog('ERROR', `升级实例「${inst.name}」(id=${inst.id}) 失败：${e?.message || e}`);
     return reply.code(500).send({ error: '升级失败：' + (e?.message || e) });
   }
+});
+
+// 实例镜像升级状态：哪些实例的镜像落后于本地最新镜像（用于面板"实例可升级"红点 + 一键升级）。
+// 面板与实例是两套镜像/容器：更新面板不会动实例，故用户常"更新了面板、实例还是旧镜像"（例：设壁纸报 127）。
+app.get('/api/admin/instances/upgrade-status', async (req, reply) => {
+  if (!requireAdmin(req, reply)) return;
+  const latestId = await latestInstanceImageId();
+  const list = listInstances();
+  const results = await Promise.all(
+    list.map(async (inst) => ({ id: inst.id, name: inst.name, outdated: await instanceOutdated(inst, latestId) })),
+  );
+  const outdated = results.filter((r) => r.outdated);
+  return { known: !!latestId, outdatedCount: outdated.length, outdatedIds: outdated.map((r) => r.id), instances: results };
+});
+
+// 一键升级全部"镜像落后"的实例（顺序执行，逐个 best-effort；个别失败不影响其余）。
+app.post('/api/admin/instances/upgrade-all', async (req, reply) => {
+  if (!requireAdmin(req, reply)) return;
+  const latestId = await latestInstanceImageId();
+  if (!latestId) return reply.code(409).send({ error: '本地尚无实例镜像，无法判断是否需要升级（请先联网拉取）' });
+  const list = listInstances();
+  let upgraded = 0;
+  let failed = 0;
+  for (const inst of list) {
+    if (!(await instanceOutdated(inst, latestId))) continue;
+    try {
+      appendPanelLog('INFO', `一键升级实例「${inst.name}」(id=${inst.id})…`);
+      await upgradeInstance(inst);
+      upgraded++;
+    } catch (e: any) {
+      failed++;
+      appendPanelLog('ERROR', `一键升级实例「${inst.name}」(id=${inst.id}) 失败：${e?.message || e}`);
+    }
+  }
+  appendPanelLog('INFO', `一键升级全部实例完成：成功 ${upgraded}、失败 ${failed}`);
+  return { ok: true, upgraded, failed };
 });
 
 // 实例侧：设置该实例可被哪些账户访问
