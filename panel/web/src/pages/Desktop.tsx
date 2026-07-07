@@ -14,6 +14,11 @@ function desktopUrl(id: string) {
   );
 }
 
+// Kasm 嵌入文档要求 iframe allow 含 self，才能把 clipboard-read/write 传给内嵌 noVNC（KasmVDI 模式）。
+function vncIframeAllow() {
+  return 'clipboard-read; clipboard-write; self; microphone; camera; autoplay';
+}
+
 // 「无感输入」钩子：装进同源 iframe，让用户直接在微信里打中文。
 // - compositionend（中文提交）→ 经 xclip+xdotool 转发（绕开 VNC keysym 容量上限）。
 // - 转发未完成期间（队列活跃），把后续可见字符 + 回车/退格也串进同一队列按序送出 →
@@ -84,6 +89,85 @@ function installSeamlessIme(win: Window, doc: Document, instId: string): () => v
   };
 }
 
+// 修复 KasmVNC 无缝剪贴板「同窗口粘贴始终旧内容」：
+// noVNC 仅在 window focus 变化后的第一次 click 才调 checkLocalClipboard()，同窗口内 _resendClipboardNextUserDrivenEvent
+// 已为 false 就不再重读本机剪贴板；切换微信窗口会触发 focus → 才更新。此处每次 Ctrl+V 前强制同步。
+function installClipboardFreshSync(win: Window, doc: Document): () => void {
+  if (!win.isSecureContext) return () => {};
+
+  let busy = false;
+  const isPaste = (e: KeyboardEvent) => (e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === 'v';
+
+  const syncTextToRemote = (text: string) => {
+    win.postMessage({ action: 'clipboardsnd', value: text }, '*');
+  };
+
+  const syncFromLocal = async (): Promise<boolean> => {
+    if (!navigator.clipboard?.read) {
+      if (!navigator.clipboard?.readText) return false;
+      const text = await navigator.clipboard.readText();
+      if (text) syncTextToRemote(text);
+      return !!text;
+    }
+    const items = await navigator.clipboard.read();
+    const ui = (win as any).UI;
+    if (ui?.rfb?.clipboardPasteDataFrom) {
+      await ui.rfb.clipboardPasteDataFrom(items);
+      return true;
+    }
+    for (const item of items) {
+      if (item.types.includes('text/plain')) {
+        const text = await (await item.getType('text/plain')).text();
+        if (text) {
+          syncTextToRemote(text);
+          return true;
+        }
+      }
+    }
+    return false;
+  };
+
+  const forwardPaste = () => {
+    const mod = /Mac|iPhone|iPad/i.test(navigator.platform) ? { metaKey: true } : { ctrlKey: true };
+    const target = doc.getElementById('noVNC_keyboardinput') || doc.getElementById('noVNC_canvas');
+    if (!target) return;
+    for (const type of ['keydown', 'keyup'] as const) {
+      target.dispatchEvent(
+        new KeyboardEvent(type, { key: 'v', code: 'KeyV', bubbles: true, cancelable: true, ...mod }),
+      );
+    }
+  };
+
+  const onKeyDown = async (e: KeyboardEvent) => {
+    if (!isPaste(e) || busy) return;
+    busy = true;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    try {
+      await syncFromLocal();
+      // 等剪贴板经 VNC 推到容器后再发 Ctrl+V
+      await new Promise<void>((r) => requestAnimationFrame(() => requestAnimationFrame(() => r())));
+      forwardPaste();
+    } catch {
+      forwardPaste();
+    } finally {
+      busy = false;
+    }
+  };
+
+  const onMouseDown = () => {
+    // 点击输入框后常会紧跟 Ctrl+V；提前异步同步，缩小 race 窗口
+    void syncFromLocal().catch(() => {});
+  };
+
+  win.addEventListener('keydown', onKeyDown, true);
+  win.addEventListener('mousedown', onMouseDown, true);
+  return () => {
+    win.removeEventListener('keydown', onKeyDown, true);
+    win.removeEventListener('mousedown', onMouseDown, true);
+  };
+}
+
 interface TFile {
   name: string;
   size: number;
@@ -93,6 +177,44 @@ function humanSize(n: number) {
   if (n < 1024 * 1024) return (n / 1024).toFixed(0) + ' KB';
   if (n < 1024 * 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + ' MB';
   return (n / 1024 / 1024 / 1024).toFixed(2) + ' GB';
+}
+
+// KasmVNC/noVNC 客户端 bundle 偶发未捕获异常（实测长时间空闲后报 "Cannot read properties of undefined
+// (reading 'lastActiveAt')"），会弹出其致命错误浮层（#noVNC_fallback_error 加 .noVNC_open）并卡死桌面，
+// 此时底层 ws 已死、自带重连也救不回。返回错误文案以便记日志；无致命错误则返回 null。
+function fatalErrorMsg(doc: Document | null | undefined): string | null {
+  try {
+    const el = doc?.getElementById('noVNC_fallback_error');
+    if (el && el.classList.contains('noVNC_open')) {
+      return doc?.getElementById('noVNC_fallback_errormsg')?.textContent?.trim() || 'KasmVNC 致命错误';
+    }
+  } catch {
+    /* 同源正常不会到这 */
+  }
+  return null;
+}
+
+// 致命崩溃自愈限频：同一实例 5 分钟内最多自动重连 4 次，超限改走手动恢复，杜绝"崩溃→重载→又崩"的死循环。
+function allowAutoRecover(iid: string): boolean {
+  const key = `woc_fatal_${iid}`;
+  let n = 0;
+  let last = 0;
+  try {
+    const o = JSON.parse(sessionStorage.getItem(key) || '{}');
+    n = Number(o.n) || 0;
+    last = Number(o.t) || 0;
+  } catch {
+    /* ignore */
+  }
+  const now = Date.now();
+  if (now - last > 5 * 60 * 1000) n = 0; // 距上次自愈超 5min → 计数清零（视作长时间稳定后的新一轮崩溃）
+  if (n >= 4) return false;
+  try {
+    sessionStorage.setItem(key, JSON.stringify({ n: n + 1, t: now }));
+  } catch {
+    /* ignore */
+  }
+  return true;
 }
 
 const MenuIcon = (
@@ -138,16 +260,10 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
     // 「重新连接」按钮与「重启实例」后的重连同样走整页重载（见 restartInstance / 桌面无响应面板）。
     window.location.reload();
   };
-  // 声音（扬声器）开关，默认关。1.1.7 本就没有音频桥、连接很稳；音频是经一条额外 socket.io 连到实例 kclient，
-  // 为排除它对连接稳定性的影响、并回到 1.1.7 的连接行为，默认不连音频桥；想听声音再开（开关进 effect 依赖，
-  // 关→断开音频桥，开→建立）。
-  const [soundOn, setSoundOn] = useState(() => {
-    try {
-      return window.localStorage.getItem('woc_sound_on') === '1';
-    } catch {
-      return false;
-    }
-  });
+  // 声音（扬声器）开关：每次打开实例都默认【关】，不持久化 on 状态（用户要求）。音频桥是额外一条到 kclient
+  // 的 socket.io，蓝牙外放(AirPods)等场景交互较敏感，默认关最稳、最可预期；想听声音手动开即可（开→建立音频桥，
+  // 关→断开）。开了之后在桌面上点一下即可解挂起出声（见下方 resumePlayback 的 iframe 手势监听）。
+  const [soundOn, setSoundOn] = useState(false);
   const toggleSound = () => {
     const v = !soundOn;
     setSoundOn(v);
@@ -180,11 +296,23 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
   const [uploading, setUploading] = useState(false);
   const [starting, setStarting] = useState(false);
   const [control, setControl] = useState<{ free: boolean; mine: boolean; holder: string | null } | null>(null);
+  const [showSettings, setShowSettings] = useState(false);
+  const [settingsTab, setSettingsTab] = useState<'bg' | 'font'>('bg');
+  const [bgList, setBgList] = useState<string[]>([]);
+  const [fontList, setFontList] = useState<string[]>([]);
+  const [bgUploading, setBgUploading] = useState(false);
+  const [fontUploading, setFontUploading] = useState(false);
+  const [currentBg, setCurrentBg] = useState('');
+  const [currentFont, setCurrentFont] = useState('');
+  const bgInput = useRef<HTMLInputElement>(null);
+  const fontInput = useRef<HTMLInputElement>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const frameRef = useRef<HTMLIFrameElement>(null);
+  const remoteClipRef = useRef(''); // KasmVDI 下容器→本机走 postMessage，textarea 不更新
   const dragDepth = useRef(0);
   const lastBeat = useRef(0);
   const audioRef = useRef<VncAudio | null>(null);
+  const recovering = useRef(false); // 致命崩溃自愈进行中（防错误浮层轮询与 error 事件重复触发重载）
 
   const inst = instances.find((i) => i.id === id);
   const profile = appProfile(inst?.appType); // 按应用类型显示正确文案（微信/Chromium…）
@@ -204,8 +332,10 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
     setFiles([]);
     setShowClip(false);
     setClipText('');
+    remoteClipRef.current = '';
     setImeText('');
     setProbing(true);
+    recovering.current = false;
   }, [id]);
 
   // 桌面久未加载出来 → 判为"无响应"，把无限转圈换成可操作的重试/重启，不让用户干等。
@@ -271,6 +401,35 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
       window.removeEventListener('dragleave', onLeave);
       window.removeEventListener('drop', onDropWin);
     };
+  }, [showVnc]);
+
+  // 粘贴图片 → 上传到桌面（issue #91）：截图不能经 VNC 剪贴板送进容器（RFB 剪贴板仅文本），故把粘贴的
+  // 图片存成桌面文件，用户在应用里「+/文件」取用即可。焦点在输入框/文本域时不拦截（让原生粘贴文字生效）。
+  useEffect(() => {
+    if (!showVnc) return;
+    const onPaste = (e: ClipboardEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+      const items = e.clipboardData?.items;
+      if (!items) return;
+      const imgs: File[] = [];
+      for (const it of Array.from(items)) {
+        if (it.kind === 'file' && it.type.startsWith('image/')) {
+          const f = it.getAsFile();
+          if (f) {
+            const ext = (f.type.split('/')[1] || 'png').replace('jpeg', 'jpg');
+            imgs.push(new File([f], `粘贴图片-${Date.now()}.${ext}`, { type: f.type }));
+          }
+        }
+      }
+      if (imgs.length) {
+        e.preventDefault();
+        uploadFiles(imgs); // 内部会 toast 上传结果
+      }
+    };
+    window.addEventListener('paste', onPaste);
+    return () => window.removeEventListener('paste', onPaste);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [showVnc]);
 
   // 控制权（交互驱动的心跳软锁）：每 3s 只读轮询当前操作者；超 TTL 自动释放。
@@ -343,6 +502,29 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
     }
   }, [id, inputMode]);
 
+  // KasmVDI 模式：容器→本机剪贴板经 postMessage clipboardrx 回传（不会写入 noVNC 面板 textarea）。
+  useEffect(() => {
+    if (!showVnc || !frameLoaded) return;
+    const onMsg = (e: MessageEvent) => {
+      if (e.source !== frameRef.current?.contentWindow) return;
+      if (e.data?.action === 'clipboardrx' && typeof e.data.value === 'string') {
+        remoteClipRef.current = e.data.value;
+        setClipText(e.data.value);
+      }
+    };
+    window.addEventListener('message', onMsg);
+    return () => window.removeEventListener('message', onMsg);
+  }, [showVnc, frameLoaded, id]);
+
+  // 每次粘贴前强制同步本机剪贴板（修 KasmVNC 同窗口不重读的 bug）
+  useEffect(() => {
+    if (!showVnc || !frameLoaded) return;
+    const win = frameRef.current?.contentWindow;
+    const doc = frameRef.current?.contentDocument;
+    if (!win || !doc) return;
+    return installClipboardFreshSync(win, doc);
+  }, [showVnc, frameLoaded, id]);
+
   // 无感模式：往同源 iframe 装「中文转发 + 有序队列」钩子；切回转发/重连/卸载时自动移除。
   useEffect(() => {
     if (inputMode !== 'seamless' || !showVnc || !frameLoaded || !id) return;
@@ -363,30 +545,86 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
     const isFocused = () => !document.hidden && document.hasFocus();
     const sync = () => audio.setActive(isFocused());
     sync(); // 初始：若当前已聚焦则立即开声
+    // 关窗/关标签页时彻底断开音频桥（issue #82）：React effect 的清理在直接关闭窗口时不一定执行，
+    // 残留的 audio socket.io（开了麦克风时还占着 getUserMedia）会留在实例上，下次再进与新连接并存，
+    // 把实例顶到"需重启"。pagehide 在页面真正被丢弃（非进 bfcache）时同步断开，避免该残留。
+    const onPageHide = (e: PageTransitionEvent) => {
+      if (!e.persisted) audio.destroy();
+    };
     document.addEventListener('visibilitychange', sync);
     window.addEventListener('focus', sync);
     window.addEventListener('blur', sync);
+    window.addEventListener('pagehide', onPageHide);
     return () => {
       document.removeEventListener('visibilitychange', sync);
       window.removeEventListener('focus', sync);
       window.removeEventListener('blur', sync);
+      window.removeEventListener('pagehide', onPageHide);
       audio.destroy();
       audioRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [showVnc, id, soundOn]);
 
-  // VNC 连接态监测——仅记录、不自动重连/重启。
-  // 1.1.7 本就没有任何"面板侧自动重连/自动重启"，连接很稳；本会话加的自动重载/自动重启(heal)/回前台重载
-  // 反而造成"频繁卡死/重启"的churn，故全部撤掉，回到 1.1.7 的行为：由 noVNC 自带重连兜底，仍不行用户手动
-  // 「重新连接/重启」。这里只把 kasmweb 在 iframe <html> 上的连接态 class 变化回传 [client] 日志，用于排查。
+  // 让「点桌面画面」也能解挂起音频出声：浏览器自动播放策略会挂起 AudioContext，需用户手势恢复；但音频桥
+  // 的手势监听绑在父窗口上，而用户点的是同源 iframe 内的桌面，事件不冒泡到父窗口 → 故"点画面没用、得重开声音
+  // 开关"。这里在 iframe 内补一个手势监听，点桌面/按键即转调 resumePlayback() 恢复播放。
+  useEffect(() => {
+    if (!showVnc || !id || !soundOn || !frameLoaded) return;
+    const win = frameRef.current?.contentWindow;
+    if (!win) return;
+    const onGesture = () => audioRef.current?.resumePlayback();
+    try {
+      win.addEventListener('pointerdown', onGesture, true);
+      win.addEventListener('keydown', onGesture, true);
+    } catch {
+      return;
+    }
+    return () => {
+      try {
+        win.removeEventListener('pointerdown', onGesture, true);
+        win.removeEventListener('keydown', onGesture, true);
+      } catch {
+        /* ignore */
+      }
+    };
+  }, [showVnc, id, soundOn, frameLoaded]);
+
+  // 致命崩溃自愈：仅在 KasmVNC 真的弹出致命错误浮层时触发——整页重载是干净重连的唯一可靠路径
+  // （旧 ws 已死，重载后干净重连；与 setMode/restartInstance 同理，不会引发新旧 ws 并存卡死 Xvnc）。
+  // 与本会话曾撤掉的"激进自动重连"本质不同：那是连接态一抖就重连导致 churn；这里只在【确认致命崩溃】
+  // 时重载一次，且 5min 内限 4 次、超限转手动恢复浮层，绝不死循环。
+  const recoverFromFatal = (msg: string) => {
+    if (recovering.current || !id) return;
+    recovering.current = true;
+    if (allowAutoRecover(id)) {
+      api.clientLog(id, `KasmVNC 致命错误，自动重连：${msg}`);
+      toast('桌面连接异常，正在自动重连…', 'error');
+      window.setTimeout(() => window.location.reload(), 800);
+    } else {
+      api.clientLog(id, `KasmVNC 反复致命错误，停止自动重连、转手动恢复：${msg}`);
+      setFrameLoaded(false);
+      setLoadStuck(true); // 露出"桌面无响应"浮层，由用户「重新连接/重启实例」
+      recovering.current = false;
+    }
+  };
+
+  // VNC 连接态监测 + 致命崩溃检测。
+  // 连接态：把 kasmweb 在 iframe <html> 上的连接态 class 变化回传 [client] 日志，用于排查（仅记录、不因抖动重连）。
+  // 致命崩溃：每 3s 检查 KasmVNC 致命错误浮层是否弹出（如长时间空闲后的 'lastActiveAt' 崩溃），弹出即自愈重连。
   useEffect(() => {
     if (!showVnc || !frameLoaded || !id) return;
     let lastState = '';
     const t = window.setInterval(() => {
+      const doc = frameRef.current?.contentDocument;
+      const fatal = fatalErrorMsg(doc);
+      if (fatal) {
+        recoverFromFatal(fatal);
+        return;
+      }
       let state = '';
       try {
-        const c = frameRef.current?.contentDocument?.documentElement?.classList;
+        const c = doc?.documentElement?.classList;
         if (!c) return;
         state = c.contains('noVNC_connected')
           ? 'connected'
@@ -406,6 +644,34 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
       }
     }, 3000);
     return () => window.clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showVnc, frameLoaded, id]);
+
+  // 更快的致命崩溃捕获：直接监听同源 iframe window 的 'error'（KasmVNC 报 Uncaught 时同步触发，比 3s 轮询快），
+  // 但仅在延迟复核确认致命错误浮层真的弹出后才重连——排除良性报错，杜绝误重载。
+  useEffect(() => {
+    if (!showVnc || !frameLoaded || !id) return;
+    const win = frameRef.current?.contentWindow;
+    if (!win) return;
+    const onErr = () => {
+      window.setTimeout(() => {
+        const msg = fatalErrorMsg(frameRef.current?.contentDocument);
+        if (msg) recoverFromFatal(msg);
+      }, 400);
+    };
+    try {
+      win.addEventListener('error', onErr);
+    } catch {
+      return;
+    }
+    return () => {
+      try {
+        win.removeEventListener('error', onErr);
+      } catch {
+        /* ignore */
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [showVnc, frameLoaded, id]);
 
   if (!id) {
@@ -460,6 +726,100 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
     }
   };
 
+  // ---------- 桌面壁纸 ----------
+  const refreshBgList = async () => {
+    if (!id) return;
+    try { const r = await api.listBackgrounds(id); setBgList(r.backgrounds); } catch { /* ignore */ }
+    try { const r = await api.getCurrentBackground(id); setCurrentBg(r.background); } catch { /* ignore */ }
+  };
+
+  const uploadBg = async () => {
+    const input = bgInput.current;
+    if (!input?.files?.length) return;
+    setBgUploading(true);
+    for (const f of Array.from(input.files)) {
+      try {
+        await api.uploadBackground(id, f.name, f);
+        toast(`壁纸「${f.name}」已上传`, 'ok');
+      } catch (e: any) { toast(e.message || '上传失败', 'error'); }
+    }
+    setBgUploading(false);
+    input.value = '';
+    refreshBgList();
+  };
+
+  const applyBg = async (name: string) => {
+    try {
+      await api.applyBackground(id, name);
+      setCurrentBg(name);
+      toast('壁纸已应用', 'ok');
+    } catch (e: any) { toast(e.message || '应用失败', 'error'); }
+  };
+
+  const clearBg = async () => {
+    try {
+      await api.clearBackground(id);
+      setCurrentBg('');
+      toast('已恢复默认黑屏', 'ok');
+    } catch (e: any) { toast(e.message || '清除失败', 'error'); }
+  };
+
+  const deleteBg = async (name: string) => {
+    if (!(await confirm({ title: `删除壁纸「${name}」？`, danger: true, confirmText: '删除' }))) return;
+    try {
+      await api.deleteBackground(id, name);
+      toast('已删除', 'ok');
+      refreshBgList();
+    } catch (e: any) { toast(e.message || '删除失败', 'error'); }
+  };
+
+  // ---------- 字体管理 ----------
+  const refreshFontList = async () => {
+    if (!id) return;
+    try { const r = await api.listFonts(id); setFontList(r.fonts); } catch { /* ignore */ }
+    try { const r = await api.getCurrentFont(id); setCurrentFont(r.fontFile); } catch { /* ignore */ }
+  };
+
+  const uploadFont = async () => {
+    const input = fontInput.current;
+    if (!input?.files?.length) return;
+    setFontUploading(true);
+    for (const f of Array.from(input.files)) {
+      try {
+        await api.uploadFont(id, f.name, f);
+        toast(`字体「${f.name}」已安装`, 'ok');
+      } catch (e: any) { toast(e.message || '上传失败', 'error'); }
+    }
+    setFontUploading(false);
+    input.value = '';
+    refreshFontList();
+  };
+
+  const deleteFont = async (name: string) => {
+    if (!(await confirm({ title: `删除字体「${name}」？`, danger: true, confirmText: '删除' }))) return;
+    try {
+      await api.deleteFont(id, name);
+      toast('已删除，字体缓存已刷新', 'ok');
+      refreshFontList();
+    } catch (e: any) { toast(e.message || '删除失败', 'error'); }
+  };
+
+  const applyUserFont = async (name: string) => {
+    try {
+      await api.applyFont(id, name);
+      setCurrentFont(name);
+      toast('字体已应用，重启微信后完全生效', 'ok');
+    } catch (e: any) { toast(e.message || '应用失败', 'error'); }
+  };
+
+  const resetFontDefault = async () => {
+    try {
+      await api.resetFontDefault(id);
+      setCurrentFont('');
+      toast('已恢复系统默认字体（文泉驿），重启微信后生效', 'ok');
+    } catch (e: any) { toast(e.message || '重置失败', 'error'); }
+  };
+
   // 同源 iframe：把键盘焦点交给 VNC，帮助宿主机输入法把合成的字送进去
   const focusFrame = () => {
     try {
@@ -492,20 +852,65 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
     }
   };
 
-  // 跨设备剪贴板（文本）：通过同源 iframe 直接喂给 KasmVNC 自带的剪贴板 textarea 并触发其发送逻辑
-  // （内部走 RFB.clipboardPasteFrom → clientCutText）。不依赖浏览器异步剪贴板 API，故 http/局域网 IP 下也可用，
-  // 规避了"非安全上下文禁用 navigator.clipboard 导致粘贴失败"的问题。文本会进入容器系统剪贴板，
-  // 在微信输入框按 Ctrl+V 即可粘贴。
+  // 跨设备剪贴板：noVNC 在 iframe 内会进入 KasmVDI 模式，官方上行通道是 postMessage clipboardsnd；
+  // 同时触发 textarea change 作为兜底（走 UI.clipboardSend → RFB.clipboardPasteFrom）。
   const pushClipboardToRemote = (text: string): boolean => {
     try {
-      const doc = frameRef.current?.contentDocument;
-      const ta = doc?.getElementById('noVNC_clipboard_text') as HTMLTextAreaElement | null;
-      if (!doc || !ta) return false;
-      ta.value = text;
-      ta.dispatchEvent(new (frameRef.current!.contentWindow as any).Event('change', { bubbles: true }));
+      const win = frameRef.current?.contentWindow;
+      if (!win) return false;
+      win.postMessage({ action: 'clipboardsnd', value: text }, '*');
+      try {
+        const ta = frameRef.current?.contentDocument?.getElementById('noVNC_clipboard_text') as HTMLTextAreaElement | null;
+        if (ta) {
+          ta.value = text;
+          ta.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+      } catch {
+        /* postMessage 已发出，DOM 兜底失败可忽略 */
+      }
       return true;
     } catch {
       return false;
+    }
+  };
+
+  // 安全上下文（HTTPS / localhost）下读取本机剪贴板：文本直送容器，图片自动上传到桌面。
+  const pasteFromLocal = async () => {
+    if (!window.isSecureContext || !navigator.clipboard?.read) {
+      toast('无法自动读取本机剪贴板（需 HTTPS 或 localhost）。请在本框内手动 Ctrl+V 粘贴', 'error');
+      return;
+    }
+    try {
+      const items = await navigator.clipboard.read();
+      for (const item of items) {
+        if (item.types.includes('image/png')) {
+          const blob = await item.getType('image/png');
+          const file = new File([blob], `clipboard-${Date.now()}.png`, { type: 'image/png' });
+          if (!id) return;
+          setUploading(true);
+          try {
+            await api.uploadFile(id, file);
+            toast('剪贴板图片已上传到桌面，可在应用里打开发送', 'ok');
+            refreshFiles();
+          } finally {
+            setUploading(false);
+          }
+          return;
+        }
+        if (item.types.includes('text/plain')) {
+          const text = await (await item.getType('text/plain')).text();
+          setClipText(text);
+          if (pushClipboardToRemote(text)) {
+            toast('本机文本已发送到容器剪贴板，在应用输入框按 Ctrl+V 粘贴', 'ok');
+          } else {
+            toast('发送失败：桌面尚未连接', 'error');
+          }
+          return;
+        }
+      }
+      toast('剪贴板中没有可识别的文本或图片', 'error');
+    } catch {
+      toast('读取本机剪贴板被拒绝，请允许浏览器剪贴板权限后重试', 'error');
     }
   };
 
@@ -530,6 +935,10 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
     setImeSending(true);
     try {
       await api.typeInInstance(id, t);
+      // 打完直接补一个回车把消息发出去（issue #81），焦点【始终留在本输入条】。
+      // 切勿在转发模式把焦点切回虚拟机——那等于开了"无感输入"，用户接着打的拼音会以原始 keysym 直灌微信
+      // 输入框（出现 "nniih'h你好啊" 这种串码）。下一条仍在本条用本机输入法安全地打。
+      await api.keyInInstance(id, 'Return');
       setImeText('');
     } catch (e: any) {
       toast(e?.message || '发送失败：请确认实例已「升级实例」（镜像含 xclip/xdotool）', 'error');
@@ -538,9 +947,15 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
     }
   };
 
-  // 读取容器（微信侧）当前剪贴板内容到本框，便于把容器内复制的文字带回本地
+  // 读取容器（微信侧）当前剪贴板：KasmVDI 下以 postMessage 缓存为准，textarea 可能陈旧
   const pullClipboardFromRemote = () => {
     try {
+      const cached = remoteClipRef.current;
+      if (cached) {
+        setClipText(cached);
+        toast('已读取容器剪贴板', 'ok');
+        return;
+      }
       const doc = frameRef.current?.contentDocument;
       const ta = doc?.getElementById('noVNC_clipboard_text') as HTMLTextAreaElement | null;
       if (ta) {
@@ -657,9 +1072,14 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
               </button>
             )}
             {isAdmin && (
-              <button className="ws-action" title="重启实例（修复卡死/最小化丢失）" onClick={restartInstance}>
-                重启
-              </button>
+              <>
+                <button className={'ws-action' + (showSettings ? ' on' : '')} title="桌面设置（壁纸/字体）" onClick={() => { setShowSettings((v) => !v); if (!showSettings) { refreshBgList(); refreshFontList(); } }}>
+                  桌面
+                </button>
+                <button className="ws-action" title="重启实例（修复卡死/最小化丢失）" onClick={restartInstance}>
+                  重启
+                </button>
+              </>
             )}
           </>
         )}
@@ -743,7 +1163,7 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
             className="iv-frame"
             src={desktopUrl(id)}
             title={`${appLabel} · 实例桌面`}
-            allow="clipboard-read; clipboard-write; microphone; camera; autoplay"
+            allow={vncIframeAllow()}
             onLoad={() => {
               setFrameLoaded(true);
               if (id) api.clientLog(id, 'iframe 已加载（noVNC 页面就绪，开始连 VNC）');
@@ -761,9 +1181,9 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
               <div className="spinner" />
               <div className="iv-loading-text">正在连接桌面…</div>
               <div className="iv-loading-sub">{profile.enterHint}</div>
-              <div className="iv-loading-sub">拖文件到此处即可上传；声音自动开启，点一下画面即可出声</div>
+              <div className="iv-loading-sub">拖文件到此处即可上传；需要声音点顶部「声音」开启，再在画面上点一下即出声</div>
               {!window.isSecureContext && (
-                <div className="iv-loading-warn">当前非 HTTPS 访问，浏览器将禁用麦克风与摄像头（音频播放不受影响）</div>
+                <div className="iv-loading-warn">当前非安全上下文（非 HTTPS 且非 localhost），浏览器将禁用剪贴板/麦克风/摄像头（音频播放不受影响）</div>
               )}
             </div>
           )}
@@ -872,15 +1292,94 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
                 placeholder="在此输入或粘贴文本，点「发送到剪贴板」后到应用输入框按 Ctrl+V 粘贴"
                 rows={5}
               />
-              <button className="btn btn-primary files-upload" onClick={sendClip}>
-                发送到剪贴板
-              </button>
+              <div className="clip-actions">
+                <button className="btn btn-primary files-upload" onClick={sendClip}>
+                  发送到剪贴板
+                </button>
+                {window.isSecureContext && (
+                  <button className="btn files-upload" disabled={uploading} onClick={pasteFromLocal}>
+                    从本机剪贴板读取
+                  </button>
+                )}
+              </div>
               <button className="btn-text" style={{ alignSelf: 'flex-start', marginTop: 6 }} onClick={pullClipboardFromRemote}>
                 ↓ 读取容器剪贴板到此框
               </button>
               <div className="files-hint">
-                局域网 http 访问时浏览器会禁用系统级剪贴板同步，故用此框中转：文本→容器剪贴板，再在应用里 Ctrl+V。
+                {window.isSecureContext
+                  ? 'HTTPS 或 localhost 下桌面内可直接 Ctrl+C/V 同步剪贴板（含图片）。若未生效，用「从本机剪贴板读取」或在此框粘贴后点发送。'
+                  : '局域网 IP 的 http 访问不是安全上下文，浏览器禁用剪贴板 API。请在此框手动 Ctrl+V 粘贴文本后点「发送」；图片请用「文件」上传。'}
               </div>
+            </div>
+          )}
+
+          {showSettings && (
+            <div className="iv-files">
+              <div className="files-head">
+                <span>桌面设置</span>
+                <button className="btn-text" onClick={() => setShowSettings(false)}>关闭</button>
+              </div>
+              <div className="settings-tabs">
+                <button className={'settings-tab' + (settingsTab === 'bg' ? ' on' : '')} onClick={() => setSettingsTab('bg')}>壁纸</button>
+                <button className={'settings-tab' + (settingsTab === 'font' ? ' on' : '')} onClick={() => setSettingsTab('font')}>字体</button>
+              </div>
+
+              {settingsTab === 'bg' && (
+                <div className="settings-panel">
+                  <input ref={bgInput} type="file" accept="image/*" multiple style={{ display: 'none' }} onChange={uploadBg} />
+                  <button className="btn btn-primary files-upload" disabled={bgUploading} onClick={() => bgInput.current?.click()}>
+                    {bgUploading ? '上传中…' : '＋ 上传壁纸'}
+                  </button>
+                  {currentBg && (
+                    <button className="btn-text" style={{ alignSelf: 'flex-start', color: 'var(--danger)', fontSize: 12 }} onClick={clearBg}>
+                      清除壁纸，恢复默认黑屏
+                    </button>
+                  )}
+                  <div className="files-hint">单击缩略图即可应用。支持 JPG / PNG 等常见格式。</div>
+                  {bgList.length === 0 && <div className="muted small" style={{ padding: '10px 2px' }}>暂无壁纸</div>}
+                  <div className="bg-grid">
+                    {bgList.map((name) => (
+                      <div key={name} className={'bg-card' + (currentBg === name ? ' active' : '')} onClick={() => applyBg(name)} title="单击应用">
+                        <div className="bg-thumb-wrap">
+                          <img className="bg-thumb" src={`/api/admin/instances/${id}/backgrounds/${encodeURIComponent(name)}/image`} alt={name} loading="lazy" />
+                          {currentBg !== name && <div className="bg-hint">单击应用</div>}
+                          {currentBg === name && <span className="bg-active-badge">✓ 使用中</span>}
+                          <button className="bg-del" title="删除" onClick={(e) => { e.stopPropagation(); deleteBg(name); }}>✕</button>
+                        </div>
+                        <span className="bg-name">{name}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {settingsTab === 'font' && (
+                <div className="settings-panel">
+                  <input ref={fontInput} type="file" accept=".ttf,.otf,.ttc" multiple style={{ display: 'none' }} onChange={uploadFont} />
+                  <button className="btn btn-primary files-upload" disabled={fontUploading} onClick={() => fontInput.current?.click()}>
+                    {fontUploading ? '上传中…' : '＋ 上传字体'}
+                  </button>
+                  {currentFont && (
+                    <button className="btn-text" style={{ alignSelf: 'flex-start', color: 'var(--danger)', fontSize: 12 }} onClick={resetFontDefault}>
+                      恢复默认（文泉驿）
+                    </button>
+                  )}
+                  <div className="files-hint">支持 TTF / OTF / TTC 格式。应用字体后需重启微信（在面板杀一次）才能完全生效。</div>
+                  {fontList.length === 0 && <div className="muted small" style={{ padding: '10px 2px' }}>暂无字体</div>}
+                  <div className="font-grid">
+                    {fontList.map((name) => (
+                      <div key={name} className={'font-card' + (currentFont === name ? ' active' : '')} onClick={() => applyUserFont(name)} title="点击应用">
+                        {currentFont === name && <span className="font-badge">✓ 使用中</span>}
+                        <button className="font-del" title="删除" onClick={(e) => { e.stopPropagation(); deleteFont(name); }}>✕</button>
+                        <div className="font-preview">
+                          <span className="font-preview-text">Aa</span>
+                        </div>
+                        <span className="font-name">{name}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
           )}
           </div>
@@ -897,7 +1396,7 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
                     sendImeText();
                   }
                 }}
-                placeholder="中文输入这里 → 回车送进应用（先点好应用的输入框）。Shift+回车换行。"
+                placeholder="中文输入这里 → 回车直接发送到应用（先点好应用的输入框）。Shift+回车换行。"
                 rows={1}
               />
               <button
