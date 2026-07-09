@@ -155,6 +155,12 @@ export class VncAudio {
     this.socket.on('connect', () => {
       if (this.active) this.open();
     });
+    // 关键：断线必须复位 opened，否则重连后 open() 以为已经开过、跳过 emit('open')，
+    // 服务端(kclient)永远不会重新开始推流 → 实例升级/重启/面板更新/网络抖动后全程静音
+    //（用户反馈"声音大概率播放不出来"的主因）。复位后上面的 connect 处理器会重新 open。
+    this.socket.on('disconnect', () => {
+      this.opened = false;
+    });
   }
 
   // 焦点变化时调用：true=本实例获得焦点（出声+收音），false=失焦（断开设备）。
